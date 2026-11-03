@@ -22,6 +22,9 @@ class Request
     /** @var resource|null injected body source for tests; null reads php://input */
     private $inputStream;
     private ?BodySpool $spool = null;
+    /** @var resource|null request-owned one-pass upload stream */
+    private $streamingBody = null;
+    private ?BodySpool $streamDecoder = null;
     private ?string $accessKeyId = null;
     private ?string $claimedAccessKeyId = null;
     /** @var string|null declared x-amz-content-sha256 armed by the Authenticator */
@@ -43,8 +46,8 @@ class Request
         $this->headers = $this->parseHeaders();
         $this->inputStream = $inputStream;
         // The body is never read eagerly: HEAD/GET/list requests never touch
-        // php://input, and uploads are spooled to disk-backed temp storage in
-        // bounded blocks instead of being loaded into a PHP string.
+        // php://input. Uploads use either bounded staging or a one-pass stream
+        // for capable backends with a known decoded length.
         $this->parsePath();
         $this->parseQueryParams();
     }
@@ -270,6 +273,9 @@ class Request
 
     private function ensureSpooled(): BodySpool
     {
+        if ($this->streamingBody !== null) {
+            throw new \LogicException('Request body is already being consumed as a one-pass stream');
+        }
         if ($this->spool !== null) {
             return $this->spool;
         }
@@ -298,7 +304,14 @@ class Request
             };
         }
 
-        $spool = BodySpool::create($input, $mode, $this->maxBodyBytes(), $verifier);
+        $spool = BodySpool::create($input, $mode, $this->maxBodyBytes(), $verifier, verifyMd5: $this->getHeader('Content-MD5') !== null);
+        $this->finishBodyVerification($spool, $chunkSigner);
+        $this->spool = $spool;
+        return $spool;
+    }
+
+    private function finishBodyVerification(BodySpool $spool, ?ChunkSignVerifier $chunkSigner): void
+    {
         $trailers = $spool->getTrailers();
         if ($chunkSigner !== null && ($this->streamingPayloadCtx['trailer'] ?? false)) {
             $signature = $trailers['x-amz-trailer-signature'] ?? '';
@@ -307,9 +320,19 @@ class Request
         }
         $this->requireDeclaredTrailers($trailers);
         $spool->verifyChecksumTrailers();
-        $this->spool = $spool;
-        $this->verifyDeclaredPayloadHash();
-        return $this->spool;
+        $length = $this->uploadLength();
+        if ($length !== null && $length !== $spool->getSize()) {
+            throw S3Exception::invalidRequest('Decoded request body length does not match its declared length');
+        }
+        foreach (['Content-MD5' => 'md5', 'X-Amz-Checksum-Sha256' => 'sha256',
+                  'X-Amz-Checksum-Sha1' => 'sha1', 'X-Amz-Checksum-Crc32' => 'crc32b',
+                  'X-Amz-Checksum-Crc32c' => 'crc32c'] as $header => $algorithm) {
+            $expected = $this->getHeader($header);
+            if ($expected !== null && !hash_equals(trim($expected), $spool->checksum($algorithm))) {
+                throw S3Exception::xAmzContentChecksumInvalid('Request body checksum mismatch');
+            }
+        }
+        $this->verifyDeclaredPayloadHash($spool);
     }
 
     /**
@@ -333,10 +356,11 @@ class Request
         }
     }
 
-    private function verifyDeclaredPayloadHash(): void
+    private function verifyDeclaredPayloadHash(?BodySpool $spool = null): void
     {
+        $spool ??= $this->spool;
         $declared = $this->declaredPayloadHash;
-        if ($declared === null || $this->spool === null) {
+        if ($declared === null || $spool === null) {
             return;
         }
         // Streaming/unsigned placeholders are not content hashes. Signed
@@ -344,7 +368,7 @@ class Request
         if (preg_match('/^[a-fA-F0-9]{64}$/', $declared) !== 1) {
             return;
         }
-        if (!hash_equals($declared, $this->spool->getSha256())) {
+        if (!hash_equals($declared, $spool->getSha256())) {
             throw S3Exception::xAmzContentSha256Mismatch();
         }
     }
@@ -427,6 +451,82 @@ class Request
         return $stream;
     }
 
+    /** Known decoded upload length; null means that staging is required. */
+    public function uploadLength(): ?int
+    {
+        if ($this->isAwsChunked()) {
+            return $this->getDecodedLengthHint();
+        }
+        $length = $this->getHeader('Content-Length');
+        if ($length === null || preg_match('/^[0-9]+$/', $length) !== 1
+            || strlen(ltrim($length, '0')) > strlen((string) PHP_INT_MAX)
+            || (strlen(ltrim($length, '0')) === strlen((string) PHP_INT_MAX) && strcmp(ltrim($length, '0'), (string) PHP_INT_MAX) > 0)) {
+            return null;
+        }
+        return (int) $length;
+    }
+
+    /** Direct object PUTs can use a backend's commit-after-EOF contract. */
+    public function isDirectObjectUpload(): bool
+    {
+        return $this->method === 'PUT' && $this->bucket !== '' && $this->key !== ''
+            && $this->getHeader('X-Amz-Copy-Source') === null
+            && !isset($this->queryParams['uploadId']) && !isset($this->queryParams['partNumber']);
+    }
+
+    /**
+     * Request-owned, one-pass decoded stream. Validation failures are raised
+     * by reads, including the final EOF read, before a streaming backend commits.
+     * A legacy authentication path may already have buffered the input.
+     * @return resource
+     */
+    public function getStreamingBodyStream()
+    {
+        if ($this->spool !== null) {
+            return $this->getBodyStream();
+        }
+        if ($this->streamingBody !== null) {
+            return $this->streamingBody;
+        }
+        $input = $this->inputStream ?? $this->openInputStream();
+        $pending = '';
+        $chunkSigner = null;
+        $verifier = null;
+        if ($this->streamingPayloadCtx !== null) {
+            $ctx = $this->streamingPayloadCtx;
+            $chunkSigner = new ChunkSignVerifier($ctx['secret'], $ctx['amzDate'], $ctx['region'], $ctx['service'], $ctx['signature']);
+            $verifier = static fn (string $hash, ?string $signature) => $chunkSigner->verify($hash, $signature ?? '');
+        }
+        $decoder = BodySpool::open(
+            mode: $this->isAwsChunked() ? BodySpool::MODE_AWS_CHUNKED : BodySpool::MODE_PLAIN,
+            maxBytes: $this->maxBodyBytes(),
+            chunkVerifier: $verifier,
+            consumer: static function (string $bytes) use (&$pending): void { $pending .= $bytes; },
+            verifyMd5: $this->getHeader('Content-MD5') !== null,
+        );
+        $this->streamDecoder = $decoder;
+        $finished = false;
+        $this->streamingBody = BodyInput::open(function (int $count) use ($input, $decoder, $chunkSigner, &$pending, &$finished): string {
+            while ($pending === '' && !$finished) {
+                if (feof($input)) {
+                    $decoder->finish();
+                    $this->finishBodyVerification($decoder, $chunkSigner);
+                    $finished = true;
+                    break;
+                }
+                $block = fread($input, 65536);
+                if ($block === false || ($block === '' && !feof($input))) {
+                    throw S3Exception::invalidRequest('Failed reading request body');
+                }
+                $decoder->feed($block);
+            }
+            $bytes = substr($pending, 0, $count);
+            $pending = substr($pending, strlen($bytes));
+            return $bytes;
+        });
+        return $this->streamingBody;
+    }
+
     /** SHA-256 hex over the decoded body (spools if needed). */
     public function getPayloadSha256(): string
     {
@@ -436,7 +536,7 @@ class Request
     /** @return array<string,string> request trailers, lowercased names */
     public function getTrailers(): array
     {
-        return $this->ensureSpooled()->getTrailers();
+        return ($this->streamDecoder ?? $this->ensureSpooled())->getTrailers();
     }
 
     public function getBucket(): string

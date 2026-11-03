@@ -49,6 +49,11 @@ final class BodySpool
     /** @var callable(null):void $chunkVerifier(string $dataHashHex, ?string $signatureHex) */
     private $chunkVerifier;
 
+    /** @var callable(string):void|null bounded decoded-byte consumer */
+    private $consumer;
+    /** @var array<string,\HashContext> incremental checksum verification */
+    private array $checksums = [];
+
     private int $size = 0;
     private string $pending = '';
     private int $state = self::STATE_HEADER;
@@ -67,9 +72,9 @@ final class BodySpool
      * @param callable|null $chunkVerifier called as ($dataHashHex, $signatureHex|null);
      *                                     must throw on rejection
      */
-    private function __construct(string $mode, ?int $maxBytes, ?callable $chunkVerifier)
+    private function __construct(string $mode, ?int $maxBytes, ?callable $chunkVerifier, ?callable $consumer = null, bool $verifyMd5 = false)
     {
-        $stream = fopen('php://temp/maxmemory:2097152', 'w+b');
+        $stream = fopen($consumer === null ? 'php://temp/maxmemory:2097152' : 'php://memory', 'w+b');
         if ($stream === false) {
             throw new \RuntimeException('Cannot allocate request body spool');
         }
@@ -78,6 +83,10 @@ final class BodySpool
         $this->mode = $mode;
         $this->maxBytes = $maxBytes;
         $this->chunkVerifier = $chunkVerifier;
+        $this->consumer = $consumer;
+        foreach (array_merge(['crc32b', 'crc32c', 'sha1', 'sha256'], $verifyMd5 ? ['md5'] : []) as $algorithm) {
+            $this->checksums[$algorithm] = hash_init($algorithm);
+        }
     }
 
     /**
@@ -86,21 +95,21 @@ final class BodySpool
      *
      * @param callable|null $chunkVerifier see create()
      */
-    public static function open(string $mode, ?int $maxBytes, ?callable $chunkVerifier = null): self
+    public static function open(string $mode, ?int $maxBytes, ?callable $chunkVerifier = null, ?callable $consumer = null, bool $verifyMd5 = false): self
     {
-        return new self($mode, $maxBytes, $chunkVerifier);
+        return new self($mode, $maxBytes, $chunkVerifier, $consumer, $verifyMd5);
     }
 
     /**
      * Reads the source to completion. On any exception the spool stays usable
      * for cleanup but must not be treated as a valid body.
      */
-    public static function create($input, string $mode, ?int $maxBytes, ?callable $chunkVerifier = null): self
+    public static function create($input, string $mode, ?int $maxBytes, ?callable $chunkVerifier = null, bool $verifyMd5 = false): self
     {
         if (!is_resource($input)) {
             throw new \InvalidArgumentException('Body spool input must be a stream resource');
         }
-        $spool = new self($mode, $maxBytes, $chunkVerifier);
+        $spool = new self($mode, $maxBytes, $chunkVerifier, verifyMd5: $verifyMd5);
         try {
             while (!feof($input)) {
                 $block = fread($input, self::BLOCK);
@@ -214,6 +223,12 @@ final class BodySpool
         return $this->sha256 ??= hash_final($this->hash);
     }
 
+    /** Base64 checksum of decoded bytes, without rewinding a consumed source. */
+    public function checksum(string $algorithm): string
+    {
+        return base64_encode(hash_final(hash_copy($this->checksums[$algorithm]), true));
+    }
+
     /** @return array<string,string> */
     public function getTrailers(): array
     {
@@ -239,17 +254,7 @@ final class BodySpool
             if (!isset($algorithms[$name])) {
                 continue;
             }
-            $context = hash_init($algorithms[$name]);
-            rewind($this->stream);
-            while (!feof($this->stream)) {
-                $block = fread($this->stream, self::BLOCK);
-                if ($block === false || $block === '') {
-                    break;
-                }
-                hash_update($context, $block);
-            }
-            rewind($this->stream);
-            $binary = hex2bin(hash_final($context));
+            $binary = hash_final(hash_copy($this->checksums[$algorithms[$name]]), true);
             if (!hash_equals(base64_encode($binary), trim($value))) {
                 throw S3Exception::xAmzContentChecksumInvalid(
                     "Checksum mismatch for trailer {$name}"
@@ -371,9 +376,16 @@ final class BodySpool
             throw S3Exception::entityTooLarge($this->size + $len, $this->maxBytes);
         }
         hash_update($this->hash, $data);
-        $written = fwrite($this->stream, $data);
-        if ($written === false || $written !== $len) {
-            throw S3Exception::internalError('Failed writing request body spool');
+        foreach ($this->checksums as $context) {
+            hash_update($context, $data);
+        }
+        if ($this->consumer !== null) {
+            ($this->consumer)($data);
+        } else {
+            $written = fwrite($this->stream, $data);
+            if ($written === false || $written !== $len) {
+                throw S3Exception::internalError('Failed writing request body spool');
+            }
         }
         $this->size += $len;
     }

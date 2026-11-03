@@ -41,8 +41,12 @@ class ObjectController
         }
 
         $metadata = MetadataHeaders::fromRequest($request);
-        $input = $request->getBodyStream();
-        $meta = $this->storage->putObjectFromStream($bucket, $key, $input, $metadata);
+        if ($this->storage instanceof \S3Gateway\Storage\StreamingStorage
+            && $this->storage->canStreamUploads() && $request->uploadLength() !== null) {
+            $meta = $this->storage->putObjectFromStreamingBody($bucket, $key, $request->getStreamingBodyStream(), $request->uploadLength(), $metadata);
+        } else {
+            $meta = $this->storage->putObjectFromStream($bucket, $key, $request->getBodyStream(), $metadata);
+        }
         if ($meta === null) {
             throw S3Exception::internalError('Failed to store object', "/{$bucket}/{$key}");
         }

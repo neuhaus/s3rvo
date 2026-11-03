@@ -30,8 +30,8 @@ accept no required arguments. Applications can also inject a backend into
 - Filesystem writes use a temporary sibling file and rename it into place after
   copying the input successfully.
 
-The HTTP request and authentication code still buffers request bodies. The backend
-stream interface does not by itself provide bounded-memory HTTP uploads.
+Backends receive verified, staged request bodies by default. The base storage
+interface alone does not opt a backend into the direct-upload path below.
 
 ## Multipart uploads
 
@@ -39,3 +39,19 @@ Backends can implement `MultipartStorage` to support multipart uploads and expir
 upload cleanup. Other backends return S3 `NotImplemented` (HTTP 501) for multipart
 operations. `cleanup_multipart.php` delegates expiration and removal to the selected
 backend.
+
+## Direct uploads
+
+A backend may implement `StreamingStorage` and return true from
+`canStreamUploads()` to accept known-length, one-pass HTTP uploads via
+`putObjectFromStreamingBody()`. The gateway defers body consumption, decodes
+aws-chunked framing and verifies size limits, supported checksums and signatures
+while the backend reads. Validation can fail on the final EOF read. The backend
+must validate that EOF before publishing the object and preserve any existing
+object on failure. Implementations that use framed network writes must withhold
+their final publication bytes until that read has succeeded.
+
+Other backends, unknown decoded lengths, and multipart/control requests retain
+the verified staging path. Authentication without a declared payload hash may
+also require staging before the request signature can be checked. Request
+streaming additionally depends on PHP's SAPI and reverse-proxy buffering settings.

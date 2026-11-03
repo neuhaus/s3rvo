@@ -614,7 +614,7 @@ class Authenticator
      * includes framing/checksum overhead, so only X-Amz-Decoded-Content-Length
      * counts against the object limit.
      */
-    public function checkRequestSize(string $accessKeyId): void
+    public function checkRequestSize(string $accessKeyId, bool $deferBodyRead = false): void
     {
         // Ensure per-key limits apply even when callers skip authentication
         // (tests, custom front controllers).
@@ -647,7 +647,9 @@ class Authenticator
 
         // Authoritative enforcement: spools the body under the limit for
         // methods that can carry one; no-op for GET/HEAD/DELETE/OPTIONS.
-        $this->request->enforceBodyLimit();
+        if (!$deferBodyRead) {
+            $this->request->enforceBodyLimit();
+        }
     }
 
     /**

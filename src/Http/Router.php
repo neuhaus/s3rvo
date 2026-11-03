@@ -46,7 +46,12 @@ class Router
             $this->authenticator->checkEarlyRequestSize();
 
             $accessKeyId = $this->authenticator->authenticate();
-            $this->authenticator->checkRequestSize($accessKeyId);
+            $this->authenticator->checkRequestSize(
+                $accessKeyId,
+                $this->request->isDirectObjectUpload() && $this->request->uploadLength() !== null
+                    && $this->storage instanceof \S3Gateway\Storage\StreamingStorage
+                    && $this->storage->canStreamUploads(),
+            );
 
             $this->dispatch();
 
