@@ -18,9 +18,10 @@ accept no required arguments. Applications can also inject a backend into
   be seekable; the response reads at most the requested length.
 - Metadata contains `size`, `mtime`, `mime`, and an unquoted `etag`. Bucket creation
   timestamps also come from the backend.
-- The `etag` is the hex MD5 of the object's content, or S3's multipart form
-  `md5(concatenated binary part MD5s)-{part count}`; part ETags are the parts' MD5s.
-  Clients such as rclone verify uploads against it.
+- The `etag` is an opaque validator supplied by the backend. `FileStorage`
+  returns the content MD5, or S3's multipart form
+  `md5(concatenated binary part MD5s)-{part count}`; its part ETags are the parts'
+  MD5s. Other backends may return version identifiers that are not checksums.
 - `putObjectFromStream`, `copyObject` and `createMultipartUpload` accept optional
   `ObjectMetadata` (the upload's Content-Type and `x-amz-meta-*` user metadata).
   Store it with the object and return it through `getObjectMeta`: the Content-Type as

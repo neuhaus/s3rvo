@@ -92,6 +92,12 @@ class Response
         if (!is_resource($stream) || $length < 0) {
             throw new \InvalidArgumentException('Invalid response stream or length');
         }
+        // A lazy backend can fail on its first read. Let the router still send
+        // a normal error response before committing any download headers.
+        $buffer = $length > 0 ? fread($stream, min(65536, $length)) : '';
+        if ($buffer === false || ($length > 0 && $buffer === '')) {
+            throw new \RuntimeException('Cannot read response stream');
+        }
         $partial = $options['partial'] ?? false;
         http_response_code($partial ? 206 : 200);
         foreach ($this->headers as $name => $value) {
@@ -114,13 +120,31 @@ class Response
         if (isset($options['lastModified'])) {
             header('Last-Modified: ' . gmdate('D, d M Y H:i:s \G\M\T', (int) $options['lastModified']));
         }
-        while ($length > 0 && !feof($stream)) {
-            $buffer = fread($stream, min(65536, $length));
-            if ($buffer === false || $buffer === '') {
-                break;
+        try {
+            while ($length > 0) {
+                echo $buffer;
+                $length -= strlen($buffer);
+                if (PHP_SAPI !== 'cli') {
+                    $outputBuffer = ob_get_status();
+                    if ($outputBuffer !== false && ($outputBuffer['flags'] & PHP_OUTPUT_HANDLER_FLUSHABLE)) {
+                        ob_flush();
+                    }
+                    flush();
+                }
+                if ($length === 0 || connection_aborted()) {
+                    return;
+                }
+                $buffer = fread($stream, min(65536, $length));
+                if ($buffer === false || $buffer === '') {
+                    break;
+                }
             }
-            echo $buffer;
-            $length -= strlen($buffer);
+        } catch (\Throwable $e) {
+            // Headers/body may already be on the wire. Do not let the router
+            // append an XML error to a partially delivered object. Its declared
+            // Content-Length lets the client detect the incomplete transfer.
+            Logger::error('Response stream failed during delivery: ' . $e->getMessage());
+            return;
         }
         if ($length !== 0) {
             Logger::error('Response stream ended before the declared Content-Length');
