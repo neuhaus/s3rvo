@@ -1,5 +1,5 @@
 {
-    "name": "simple-php-s3-server/s3-gateway",
+    "name": "neuhaus/s3rvo",
     "description": "A simple S3-compatible API gateway based on local filesystem",
     "type": "project",
     "require": {
